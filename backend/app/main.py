@@ -14,25 +14,18 @@ from apscheduler.schedulers.background import BackgroundScheduler
 
 from app.db import Base, engine, SessionLocal
 from app.models import Task
+from live_carbon import get_carbon_forecast
 
 
-# Create database tables if they do not exist.
 Base.metadata.create_all(bind=engine)
 
 app = FastAPI(
     title="GreenSched API",
     description="Carbon-aware scheduler for laptop computing tasks",
-    version="0.5.0",
+    version="0.6.0",
 )
 
 scheduler = BackgroundScheduler(timezone="UTC")
-
-# SIMULATED DEMO DATA. These are not real electricity measurements.
-CARBON_FORECAST = [
-    420, 380, 300, 220, 180, 240, 310, 400,
-    350, 260, 190, 230, 320, 410, 370, 280,
-    200, 170, 250, 330, 390, 300, 220, 180,
-]
 
 
 class TaskCreate(BaseModel):
@@ -66,10 +59,16 @@ def serialize_task(task):
     }
 
 
+def as_utc(value):
+    """Convert a datetime to UTC, treating naive values as UTC."""
+    if value.tzinfo is None:
+        value = value.replace(tzinfo=timezone.utc)
+    return value.astimezone(timezone.utc)
+
+
 def schedule_job(task_id: str, run_at: datetime):
-    """Register one future execution with APScheduler."""
-    if run_at.tzinfo is None:
-        run_at = run_at.replace(tzinfo=timezone.utc)
+    """Register a future task execution with APScheduler."""
+    run_at = as_utc(run_at)
 
     if run_at <= datetime.now(timezone.utc):
         return False
@@ -91,7 +90,7 @@ def start_scheduler():
     if not scheduler.running:
         scheduler.start()
 
-    # Recover future scheduled tasks from SQLite after a restart.
+    # Recover future scheduled tasks after an application restart.
     with SessionLocal() as db:
         scheduled_tasks = db.scalars(
             select(Task).where(Task.status == "scheduled")
@@ -101,13 +100,19 @@ def start_scheduler():
             if not task.scheduled_start:
                 continue
 
-            run_at = datetime.fromisoformat(task.scheduled_start)
+            run_at = as_utc(
+                datetime.fromisoformat(task.scheduled_start)
+            )
 
-            # Avoid unexpectedly running jobs whose time has passed.
+            # Do not unexpectedly execute overdue tasks.
             if run_at <= datetime.now(timezone.utc):
                 continue
 
-            schedule_job(task.id, run_at)
+            try:
+                schedule_job(task.id, run_at)
+            except Exception:
+                # Keep the application running if one job cannot be restored.
+                continue
 
 
 @app.on_event("shutdown")
@@ -120,7 +125,7 @@ def stop_scheduler():
 def root():
     return {
         "message": "Welcome to GreenSched API",
-        "version": "0.5.0",
+        "version": "0.6.0",
         "docs": "/docs",
     }
 
@@ -137,10 +142,7 @@ def health():
 @app.post("/tasks", status_code=201)
 def create_task(data: TaskCreate):
     now = datetime.now(timezone.utc)
-    deadline = data.deadline
-
-    if deadline.tzinfo is None:
-        deadline = deadline.replace(tzinfo=timezone.utc)
+    deadline = as_utc(data.deadline)
 
     if deadline <= now:
         raise HTTPException(
@@ -170,13 +172,13 @@ def create_task(data: TaskCreate):
 @app.get("/tasks")
 def list_tasks():
     with SessionLocal() as db:
-        result = db.scalars(
+        tasks = db.scalars(
             select(Task).order_by(Task.created_at.desc())
         ).all()
 
         return {
-            "count": len(result),
-            "tasks": [serialize_task(task) for task in result],
+            "count": len(tasks),
+            "tasks": [serialize_task(task) for task in tasks],
         }
 
 
@@ -196,6 +198,60 @@ def get_task(task_id: str):
 
 @app.post("/schedule/{task_id}")
 def schedule_task(task_id: str):
+    # Get a forecast before changing the database.
+    try:
+        forecast_data = get_carbon_forecast(
+            zone="IN",
+            horizon_hours=24,
+        )
+    except (RuntimeError, ValueError) as exc:
+        raise HTTPException(
+            status_code=503,
+            detail=f"Carbon forecast unavailable: {exc}",
+        ) from None
+
+    forecast_points = forecast_data.get("forecast", [])
+
+    if not forecast_points:
+        raise HTTPException(
+            status_code=503,
+            detail="No usable carbon forecast points are available",
+        )
+
+    # Normalize and sort forecast timestamps.
+    points = []
+
+    for point in forecast_points:
+        try:
+            point_time = as_utc(point["datetime"])
+            intensity = float(
+                point["carbon_intensity_gco2_kwh"]
+            )
+
+            if intensity < 0:
+                continue
+
+            points.append({
+                "datetime": point_time,
+                "intensity": intensity,
+            })
+        except (KeyError, TypeError, ValueError, AttributeError):
+            continue
+
+    points.sort(key=lambda point: point["datetime"])
+
+    if not points:
+        raise HTTPException(
+            status_code=503,
+            detail="Forecast contains no valid data points",
+        )
+
+    # Build a lookup of forecast values by timestamp.
+    intensity_by_time = {
+        point["datetime"]: point["intensity"]
+        for point in points
+    }
+
     with SessionLocal() as db:
         task = db.get(Task, task_id)
 
@@ -212,40 +268,128 @@ def schedule_task(task_id: str):
             )
 
         now = datetime.now(timezone.utc)
-        deadline = datetime.fromisoformat(task.deadline)
+        deadline = as_utc(datetime.fromisoformat(task.deadline))
 
+        # Require the whole task duration to fit before its deadline.
+        duration = timedelta(minutes=task.duration_minutes)
+
+        if deadline <= now:
+            raise HTTPException(
+                status_code=400,
+                detail="Task deadline has already passed",
+            )
+
+        # Start no earlier than the next full UTC hour.
         next_hour = (
             now.replace(minute=0, second=0, microsecond=0)
             + timedelta(hours=1)
         )
 
+        # Reserve intervals belonging to other scheduled tasks.
+        existing_tasks = db.scalars(
+            select(Task).where(
+                Task.status == "scheduled",
+                Task.scheduled_start.is_not(None),
+                Task.scheduled_finish.is_not(None),
+                Task.id != task_id,
+            )
+        ).all()
+
+        reserved_slots = []
+
+        for existing in existing_tasks:
+            reserved_start = as_utc(
+                datetime.fromisoformat(existing.scheduled_start)
+            )
+            reserved_finish = as_utc(
+                datetime.fromisoformat(existing.scheduled_finish)
+            )
+            reserved_slots.append(
+                (reserved_start, reserved_finish)
+            )
+
         candidates = []
 
-        # Find hourly start times that fit before the deadline.
-        for hour in range(24):
-            start = next_hour + timedelta(hours=hour)
-            finish = start + timedelta(minutes=task.duration_minutes)
+        # Candidate starts come from the forecast timestamps.
+        for start in sorted(intensity_by_time):
+            if start < next_hour:
+                continue
 
-            if finish <= deadline:
-                candidates.append({
-                    "start": start,
-                    "finish": finish,
-                    "intensity": CARBON_FORECAST[start.hour],
-                })
+            finish = start + duration
+
+            if finish > deadline:
+                continue
+
+            # Prevent overlapping scheduled tasks.
+            overlaps = any(
+                start < reserved_finish
+                and finish > reserved_start
+                for reserved_start, reserved_finish in reserved_slots
+            )
+
+            if overlaps:
+                continue
+
+            # Compute a duration-weighted average using hourly forecast
+            # points. Refuse candidates if any required hour is missing.
+            total_weighted_intensity = 0.0
+            covered_minutes = 0
+            cursor = start
+
+            while cursor < finish:
+                intensity = intensity_by_time.get(cursor)
+
+                if intensity is None:
+                    break
+
+                segment_end = min(
+                    cursor + timedelta(hours=1),
+                    finish,
+                )
+                segment_minutes = (
+                    segment_end - cursor
+                ).total_seconds() / 60
+
+                total_weighted_intensity += (
+                    intensity * segment_minutes
+                )
+                covered_minutes += segment_minutes
+                cursor = segment_end
+
+            if covered_minutes != task.duration_minutes:
+                continue
+
+            average_intensity = (
+                total_weighted_intensity
+                / task.duration_minutes
+            )
+
+            candidates.append({
+                "start": start,
+                "finish": finish,
+                "intensity": round(average_intensity, 2),
+            })
 
         if not candidates:
             raise HTTPException(
                 status_code=400,
-                detail="No available hourly slot fits before the deadline",
+                detail=(
+                    "No valid forecast slot fits the task duration "
+                    "and deadline without overlapping another task. "
+                    "Try a later deadline or a shorter task duration."
+                ),
             )
 
-        best = min(candidates, key=lambda item: item["intensity"])
+        # Choose the candidate with the lowest forecast intensity.
+        best = min(
+            candidates,
+            key=lambda item: item["intensity"],
+        )
 
         task.scheduled_start = best["start"].isoformat()
         task.scheduled_finish = best["finish"].isoformat()
         task.carbon_intensity = best["intensity"]
         task.status = "scheduled"
-
         db.commit()
 
         result = {
@@ -254,14 +398,45 @@ def schedule_task(task_id: str):
             "scheduled_start": task.scheduled_start,
             "scheduled_finish": task.scheduled_finish,
             "carbon_intensity_gco2_kwh": task.carbon_intensity,
-            "forecast_source": "simulated_demo_data",
+            "forecast_source": forecast_data.get(
+                "source", "Electricity Maps API"
+            ),
+            "forecast_zone": forecast_data.get("zone", "IN"),
+            "forecast_updated_at": forecast_data.get("updated_at"),
+            "forecast_granularity": forecast_data.get(
+                "temporal_granularity", "unknown"
+            ),
+            "data_type": "forecast",
             "status": task.status,
         }
 
         run_at = best["start"]
 
-    # Register only after the database transaction has committed.
-    schedule_job(task_id, run_at)
+    # Register only after the database commit. If registration fails,
+    # revert the task so it is not left falsely marked as scheduled.
+    try:
+        registered = schedule_job(task_id, run_at)
+    except Exception:
+        registered = False
+
+    if not registered:
+        with SessionLocal() as db:
+            task = db.get(Task, task_id)
+
+            if task is not None and task.status == "scheduled":
+                task.status = "pending"
+                task.scheduled_start = None
+                task.scheduled_finish = None
+                task.carbon_intensity = None
+                db.commit()
+
+        raise HTTPException(
+            status_code=503,
+            detail=(
+                "Could not register the scheduled job. "
+                "The task has been returned to pending status."
+            ),
+        )
 
     return result
 
@@ -269,12 +444,14 @@ def schedule_task(task_id: str):
 @app.get("/schedule")
 def list_schedules():
     with SessionLocal() as db:
-        result = db.scalars(
-            select(Task).where(Task.scheduled_start.is_not(None))
+        tasks = db.scalars(
+            select(Task).where(
+                Task.scheduled_start.is_not(None)
+            )
         ).all()
 
         return {
-            "count": len(result),
+            "count": len(tasks),
             "schedules": [
                 {
                     "task_id": task.id,
@@ -284,14 +461,14 @@ def list_schedules():
                     "carbon_intensity_gco2_kwh": task.carbon_intensity,
                     "status": task.status,
                 }
-                for task in result
+                for task in tasks
             ],
         }
 
 
 @app.post("/tasks/{task_id}/execute")
 def execute_task(task_id: str):
-    # Read the task and mark it as running before launching the process.
+    # Mark the task as running before starting its process.
     with SessionLocal() as db:
         task = db.get(Task, task_id)
 
@@ -349,7 +526,6 @@ def execute_task(task_id: str):
             stdout = result.stdout[-10000:]
             stderr = result.stderr[-10000:]
             exit_code = result.returncode
-
             final_status = (
                 "completed" if exit_code == 0 else "failed"
             )
@@ -357,12 +533,11 @@ def execute_task(task_id: str):
     except subprocess.TimeoutExpired:
         stderr = "Execution timed out after 30 seconds"
 
-    except OSError as exc:
-        stderr = str(exc)
+    except OSError:
+        stderr = "The Python task process could not be started"
 
     finished_at = datetime.now(timezone.utc).isoformat()
 
-    # Save execution results to SQLite.
     with SessionLocal() as db:
         task = db.get(Task, task_id)
 
