@@ -1,0 +1,566 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>GreenSched | Carbon-Aware Scheduler</title>
+  <style>
+    * { box-sizing: border-box; }
+    body { margin: 0; font-family: Inter, Segoe UI, Arial, sans-serif; background: #f4f7f5; color: #14251d; }
+    header { background: linear-gradient(115deg,#103d2b,#176344); color: white; padding: 26px max(22px, calc((100% - 1240px)/2)); }
+    header h1 { margin: 0 0 7px; letter-spacing: -.5px; }
+    header p { margin: 0; color: #d4e8db; }
+    main { max-width: 1280px; margin: 26px auto; padding: 0 20px; }
+    .grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(290px, 1fr)); gap: 18px; }
+    .card { background: white; border: 1px solid #e5ece7; border-radius: 15px; padding: 23px; box-shadow: 0 5px 18px #142b200a; margin-bottom: 18px; }
+    h2 { font-size: 19px; margin-top: 0; letter-spacing: -.2px; }
+    .eyebrow { color:#16804f; font-size:11px; font-weight:800; letter-spacing:1.2px; text-transform:uppercase; margin-bottom:8px; }
+    .metrics { display:grid; grid-template-columns:repeat(auto-fit,minmax(155px,1fr)); gap:12px; margin-bottom:18px; }
+    .metric-card { background:#fff; border:1px solid #e5ece7; border-radius:12px; padding:17px; }
+    .metric-card .muted { margin-bottom:7px; }
+    .metric-card .metric { margin:0; }
+    .detail-grid { display:grid; grid-template-columns:repeat(auto-fit,minmax(180px,1fr)); gap:12px; margin:14px 0; }
+    .detail { background:#f7faf8; border-radius:9px; padding:12px; overflow-wrap:anywhere; }
+    .detail b { display:block; font-size:12px; color:#65756b; margin-bottom:5px; }
+    .task-id-detail { border: 1px solid #b9d9c7; background: #f0faf4; }
+    .task-id-value { display:block; font-family: Consolas, monospace; font-weight:700; overflow-wrap:anywhere; }
+    label { display: block; margin: 13px 0 6px; font-size: 14px; }
+    input, textarea { width: 100%; padding: 11px; border: 1px solid #ccd7d0; border-radius: 7px; font-size: 15px; }
+    textarea { min-height: 150px; font-family: Consolas, monospace; resize: vertical; }
+    button { margin-top: 17px; padding: 12px 16px; border: 0; border-radius: 7px; background: #167448; color: white; font-weight: bold; cursor: pointer; }
+    button:hover { background: #105b37; }
+    button:disabled { opacity: .6; cursor: wait; }
+    .metric { font-size: 28px; font-weight: bold; margin: 8px 0; }
+    .muted { color: #65756b; font-size: 13px; }
+    .status { padding: 10px; background: #e6f5eb; border-radius: 7px; }
+    .status.warning { background: #fff2d6; color: #744d00; }
+    .error { background: #fde8e7; color: #8b211b; padding: 12px; border-radius: 7px; }
+    .table-wrap { overflow-x: auto; }
+    table { width: 100%; border-collapse: collapse; font-size: 14px; }
+    th, td { text-align: left; padding: 12px 9px; border-bottom: 1px solid #e5ebe7; }
+    th { color: #52645a; }
+    @media(max-width: 500px) { header { padding: 20px; } .metric { font-size: 24px; } }
+  </style>
+</head>
+<body>
+<header>
+  <h1>GreenSched</h1>
+  <p>Autonomous Green Cloud Optimizer · Carbon-Aware Workload Scheduler</p>
+</header>
+
+<main>
+  <div class="metrics">
+    <div class="metric-card"><div class="muted">Latest task status</div><div id="topStatus" class="metric">Ready</div></div>
+    <div class="metric-card"><div class="muted">Selected region</div><div id="topRegion" class="metric">—</div></div>
+    <div class="metric-card"><div class="muted">Estimated emissions</div><div id="topEmissions" class="metric">—</div></div>
+  </div>
+  <div class="grid">
+    <section class="card">
+      <h2>Submit a workload</h2>
+      <form id="taskForm">
+        <label for="taskName">Task name</label>
+        <input id="taskName" required maxlength="100" placeholder="enter name">
+        <label for="runtime">Expected runtime (minutes)</label>
+        <input id="runtime" type="number" min="1" max="1440">
+        <label for="energy">Estimated energy (kWh)</label>
+        <input id="energy" type="number" min="0.001" max="10000" step="any">
+        <label for="pythonScript">Python script to execute on AWS</label>
+        <textarea id="pythonScript" maxlength="20000" required></textarea>
+        <button id="scheduleButton" type="submit">Execute on AWS</button>
+      </form>
+      <div id="message" aria-live="polite"></div>
+      <pre id="taskOutput" class="status" style="white-space:pre-wrap;overflow-wrap:anywhere"></pre>
+    </section>
+
+    <section class="card">
+      <h2>Green scheduling decision</h2>
+      <p class="muted">Latest submitted task</p>
+      <div id="selectedRegion" class="metric">—</div>
+      <div class="detail-grid">
+        <div class="detail"><b>Task name</b><span id="detailTaskName">—</span></div>
+        <div class="detail task-id-detail"><b>Task ID</b><span id="detailTaskId" class="task-id-value">Waiting for task submission</span></div>
+        <div class="detail"><b>Status</b><span id="detailStatus">—</span></div>
+        <div class="detail"><b>Execution mode</b><span id="detailMode">—</span></div>
+        <div class="detail"><b>Green Score</b><span id="detailGreenScore">—</span></div>
+        <div class="detail"><b>Decision method</b><span id="detailDecisionMethod">—</span></div>
+      </div>
+      <div hidden aria-hidden="true">
+        <span id="detailStart">—</span>
+        <span id="detailEnd">—</span>
+        <span id="detailDuration">—</span>
+        <span id="detailWorker">—</span>
+      </div>
+      <p id="intensity">Carbon intensity: —</p>
+      <p id="emissions">Estimated emissions: —</p>
+      <p id="source">Data source: —</p>
+      <p id="greenScoreLine">Green Score: —</p>
+      <p id="renewableLine">Renewable energy: —</p>
+      <p id="costLine">Estimated instance price: —</p>
+      <div id="decisionNote" class="status">Loading scheduling decision from backend region data…</div>
+    </section>
+  </div>
+
+  <section class="card">
+    <h2>Configured region comparison</h2>
+    <p class="muted">Intensity is measured in gCO₂e/kWh. LIVE and SIMULATED sources are labelled separately.</p>
+    <div class="table-wrap">
+      <table>
+        <thead><tr><th>Cloud region</th><th>Electricity zone</th><th>Intensity (gCO₂e/kWh)</th><th>Renewables</th><th>Green Score</th><th>Price (USD/hour)</th><th>Source</th></tr></thead>
+        <tbody id="regions"><tr><td colspan="7">Loading…</td></tr></tbody>
+      </table>
+    </div>
+    <button id="refreshRegions" type="button">Refresh regions</button>
+  </section>
+
+  <section class="card">
+    <h2>AI Carbon Forecast</h2>
+    <p id="forecastValue" class="metric">Loading forecast…</p>
+    <p id="forecastInfo" class="muted"></p>
+    <button id="refreshForecast" type="button">Refresh forecast</button>
+  </section>
+
+  <section class="card">
+    <h2>Carbon-Aware vs Baseline</h2>
+    <p id="comparisonInfo" aria-live="polite">Loading comparison…</p>
+    <div class="grid">
+      <div>
+        <p class="muted">Carbon-aware emissions</p>
+        <div id="greenEmissions" class="metric">—</div>
+      </div>
+      <div>
+        <p class="muted">Baseline emissions</p>
+        <div id="baselineEmissions" class="metric">—</div>
+      </div>
+    </div>
+    <p id="reductionValue" class="metric">—</p>
+    <p id="comparisonWarning" class="status" role="status">Checking data sources…</p>
+    <button id="runComparison" type="button">Compare current inputs</button>
+  </section>
+
+  <section class="card">
+    <h2>Workload history</h2>
+    <div class="table-wrap">
+      <table>
+        <thead><tr><th>Task name</th><th>Created at</th><th>Region</th><th>Intensity</th><th>Est. CO₂e (g)</th><th>Status</th><th>Mode</th></tr></thead>
+        <tbody id="tasks"><tr><td colspan="7">Loading…</td></tr></tbody>
+      </table>
+    </div>
+    <button id="refreshTasks" type="button">Refresh tasks</button>
+  </section>
+</main>
+
+<script>
+  // If the backend URL changes later, update it here.
+  const API = window.GREENSCHED_API_URL || "http://127.0.0.1:8000";
+  let comparisonRequestId = 0;
+  const LAST_TASK_UI_KEY = "greensched_last_task_ui_v1";
+
+  function saveLastTaskUi(data) {
+    try { localStorage.setItem(LAST_TASK_UI_KEY, JSON.stringify(data)); } catch (_) {}
+  }
+  function readLastTaskUi() {
+    try { return JSON.parse(localStorage.getItem(LAST_TASK_UI_KEY) || "null"); } catch (_) { return null; }
+  }
+
+  function formatDate(value) {
+    if (!value) return "—";
+    const date = new Date(value);
+    return Number.isNaN(date.getTime()) ? String(value) : date.toLocaleString();
+  }
+
+  function showError(element, error) {
+    element.replaceChildren();
+    const box = document.createElement("div");
+    box.className = "error";
+    box.textContent = error.message || String(error);
+    element.appendChild(box);
+  }
+
+  async function api(path, options = {}) {
+    const response = await fetch(API + path, {
+      ...options,
+      headers: { "Content-Type": "application/json", ...(options.headers || {}) }
+    });
+    if (!response.ok) {
+      const body = await response.json().catch(() => ({}));
+      throw new Error(body.detail || `API error: ${response.status}`);
+    }
+    return response.json();
+  }
+
+  function applyRegionDecision(region, method, fromTask = false) {
+    if (!region) return;
+    const selected = region.region || region.selected_region || "Unavailable";
+    document.getElementById("topRegion").textContent = selected;
+    document.getElementById("selectedRegion").textContent = selected;
+    document.getElementById("intensity").textContent =
+      `Carbon intensity: ${region.carbon_intensity_gco2_kwh ?? "Unavailable"} gCO₂e/kWh`;
+    const source = region.carbon_data_source ?? region.source ?? "Unavailable";
+    document.getElementById("source").textContent = `Data source: ${source}`;
+    const score = region.green_score;
+    document.getElementById("greenScoreLine").textContent =
+      `Green Score: ${score == null ? "Unavailable" : Number(score).toFixed(2)}`;
+    document.getElementById("renewableLine").textContent =
+      `Renewable energy: ${region.renewable_percent == null ? "Unavailable" : `${region.renewable_percent}%`}`;
+    document.getElementById("costLine").textContent =
+      `Estimated instance price: ${region.cost_usd_per_hour == null ? "Unavailable" : `$${Number(region.cost_usd_per_hour).toFixed(4)}/hour`}`;
+    document.getElementById("detailGreenScore").textContent =
+      score == null ? "Unavailable" : Number(score).toFixed(2);
+    document.getElementById("detailDecisionMethod").textContent = method || region.selection_method || "—";
+    const energy = Number(document.getElementById("energy").value);
+    if (!fromTask && Number.isFinite(energy) && energy > 0 && region.carbon_intensity_gco2_kwh != null) {
+      const estimate = Math.round(energy * Number(region.carbon_intensity_gco2_kwh) * 1000) / 1000;
+      document.getElementById("emissions").textContent = `Estimated emissions: ${estimate} gCO₂e (estimate)`;
+      document.getElementById("topEmissions").textContent = `${estimate} g`;
+    }
+    const note = document.getElementById("decisionNote");
+    note.classList.remove("warning");
+    if (method === "GREEN_SCORE" || region.green_score != null) {
+      note.textContent = `Selected by Green Score. This is a scheduling recommendation; the configured AWS worker executes in Sydney.`;
+    } else if (method === "LOWEST_CARBON_FALLBACK") {
+      note.textContent = "Green Score is unavailable for the configured regions, so the lowest region with live carbon data is recommended. The configured AWS worker executes in Sydney.";
+      note.classList.add("warning");
+    } else {
+      note.textContent = "Region data loaded. Verify score and data source before submitting a workload.";
+    }
+  }
+
+  async function loadRegions() {
+    const body = document.getElementById("regions");
+    try {
+      const result = await api("/api/regions");
+      body.replaceChildren();
+      const regions = Array.isArray(result.regions) ? result.regions : [];
+      if (!regions.length) {
+        body.innerHTML = '<tr><td colspan="7">No region data returned by backend.</td></tr>';
+        return;
+      }
+      regions.forEach(region => {
+        const tr = document.createElement("tr");
+        const cells = [
+          region.region,
+          region.electricity_zone,
+          region.carbon_intensity_gco2_kwh == null ? "Unavailable" : Number(region.carbon_intensity_gco2_kwh).toFixed(1),
+          region.renewable_percent == null ? "Unavailable" : `${Number(region.renewable_percent).toFixed(1)}%`,
+          region.green_score == null ? "Unavailable" : Number(region.green_score).toFixed(2),
+          region.cost_usd_per_hour == null ? "Unavailable" : `$${Number(region.cost_usd_per_hour).toFixed(4)}`,
+          region.carbon_data_source || "Unavailable"
+        ];
+        cells.forEach(value => {
+          const td = document.createElement("td");
+          td.textContent = value == null ? "—" : String(value);
+          tr.appendChild(td);
+        });
+        body.appendChild(tr);
+      });
+
+      // Match backend choose_region(): prefer Green Score, otherwise lowest available carbon.
+      const scored = regions.filter(r => r.green_score != null);
+      let selected = null;
+      let method = "";
+      if (scored.length) {
+        selected = scored.reduce((best, r) => Number(r.green_score) > Number(best.green_score) ? r : best);
+        method = "GREEN_SCORE";
+      } else {
+        const carbonCandidates = regions.filter(r => r.carbon_intensity_gco2_kwh != null);
+        if (carbonCandidates.length) {
+          selected = carbonCandidates.reduce((best, r) =>
+            Number(r.carbon_intensity_gco2_kwh) < Number(best.carbon_intensity_gco2_kwh) ? r : best
+          );
+          method = "LOWEST_CARBON_FALLBACK";
+        }
+      }
+      if (selected) applyRegionDecision(selected, method);
+      else {
+        document.getElementById("selectedRegion").textContent = "No decision available";
+        document.getElementById("topRegion").textContent = "Unavailable";
+        document.getElementById("decisionNote").textContent = "Backend returned no usable carbon data; scheduler cannot safely recommend a region.";
+        document.getElementById("decisionNote").classList.add("warning");
+      }
+    } catch (error) {
+      showError(body, error);
+      document.getElementById("selectedRegion").textContent = "Decision unavailable";
+      document.getElementById("topRegion").textContent = "Unavailable";
+      document.getElementById("decisionNote").textContent = `Could not load region decision: ${error.message}`;
+      document.getElementById("decisionNote").classList.add("warning");
+    }
+  }
+
+  async function loadTasks() {
+    const body = document.getElementById("tasks");
+    try {
+      const result = await api("/api/tasks");
+      body.replaceChildren();
+      if (!result.tasks.length) {
+        body.innerHTML = '<tr><td colspan="7">No tasks yet.</td></tr>';
+        return;
+      }
+      result.tasks.forEach(task => {
+        const tr = document.createElement("tr");
+        [task.task_name, formatDate(task.created_at), task.region,
+          task.carbon_intensity == null ? "—" : Number(task.carbon_intensity).toFixed(1),
+          task.estimated_emissions_g == null ? "—" : Number(task.estimated_emissions_g).toFixed(3), task.status, task.execution_mode || "—"]
+          .forEach(value => {
+            const td = document.createElement("td");
+            td.textContent = value;
+            tr.appendChild(td);
+          });
+        body.appendChild(tr);
+      });
+
+      // Restore the latest task's ID and summary when reopening/refreshing the dashboard.
+      const latest = result.tasks[0];
+      if (latest) {
+        document.getElementById("detailTaskId").textContent = latest.task_id || "ID unavailable in task history";
+        document.getElementById("detailTaskName").textContent = latest.task_name || "—";
+        document.getElementById("detailStatus").textContent = latest.status || "—";
+        document.getElementById("detailMode").textContent = latest.execution_mode || "—";
+        document.getElementById("topStatus").textContent = latest.status || "—";
+        if (latest.region) {
+          document.getElementById("topRegion").textContent = latest.region;
+          document.getElementById("selectedRegion").textContent = latest.region;
+        }
+        if (latest.estimated_emissions_g != null) {
+          document.getElementById("topEmissions").textContent = `${latest.estimated_emissions_g} g`;
+          document.getElementById("emissions").textContent = `Estimated emissions: ${latest.estimated_emissions_g} gCO₂e (estimate)`;
+        }
+        if (latest.carbon_intensity != null) {
+          document.getElementById("intensity").textContent = `Carbon intensity: ${latest.carbon_intensity} gCO₂e/kWh`;
+        }
+        if (latest.data_source) {
+          document.getElementById("source").textContent = `Data source: ${latest.data_source}`;
+        }
+      }
+    } catch (error) {
+      showError(body, error);
+    }
+  }
+
+  async function loadForecast() {
+    const value = document.getElementById("forecastValue");
+    const info = document.getElementById("forecastInfo");
+    value.textContent = "Loading forecast…";
+    try {
+      const result = await api("/api/forecast?hours_ahead=1");
+      value.textContent = `${result.forecast_intensity_gco2_kwh} gCO₂e/kWh`;
+      info.textContent = `${result.model} · ${result.source} · ${result.warning}`;
+    } catch (error) {
+      value.textContent = "Forecast unavailable";
+      info.textContent = error.message;
+    }
+  }
+
+  async function runComparison() {
+    const requestId = ++comparisonRequestId;
+    const info = document.getElementById("comparisonInfo");
+    const green = document.getElementById("greenEmissions");
+    const baseline = document.getElementById("baselineEmissions");
+    const reduction = document.getElementById("reductionValue");
+    const warning = document.getElementById("comparisonWarning");
+    const button = document.getElementById("runComparison");
+    const energyInput = document.getElementById("energy");
+    const energy = Number(energyInput.value);
+    const taskName = document.getElementById("taskName").value.trim();
+
+    if (!Number.isFinite(energy) || energy <= 0) {
+      info.textContent = "Enter an energy value greater than zero.";
+      green.textContent = "—";
+      baseline.textContent = "—";
+      reduction.textContent = "—";
+      warning.textContent = "Comparison not run: invalid energy input.";
+      warning.classList.add("warning");
+      return;
+    }
+
+    info.textContent = `Comparing ${energy} kWh…`;
+    green.textContent = "Loading…";
+    baseline.textContent = "Loading…";
+    reduction.textContent = "";
+    button.disabled = true;
+
+    const controller = new AbortController();
+    const timeoutId = setTimeout(() => controller.abort(), 10000);
+    try {
+      const result = await api("/api/compare", {
+        method: "POST",
+        body: JSON.stringify({ task_name: taskName || "Energy Test", energy_kwh: energy }),
+        signal: controller.signal
+      });
+      // Ignore an older response if a newer comparison has already started.
+      if (requestId !== comparisonRequestId) return;
+
+      green.textContent = `${result.carbon_aware.estimated_emissions_gco2} gCO₂e`;
+      baseline.textContent = `${result.baseline.estimated_emissions_gco2} gCO₂e`;
+      reduction.textContent = `${result.estimated_reduction_percent}% estimated reduction`;
+      info.textContent = `${result.carbon_aware.region} vs ${result.baseline.region} · ` +
+        `${result.carbon_aware.data_source} / ${result.baseline.data_source}`;
+
+      const greenLive = result.carbon_aware.data_source === "LIVE";
+      const baselineLive = result.baseline.data_source === "LIVE";
+      warning.classList.toggle("warning", !(greenLive && baselineLive));
+      if (greenLive && baselineLive) {
+        warning.textContent = "Both regions use LIVE carbon-intensity data. Emissions and reduction are estimates based on the same energy assumption; this is not a measured real-world saving.";
+      } else {
+        warning.textContent = "SIMULATED data is used for at least one region. Treat this comparison as illustrative, not a verified saving.";
+      }
+    } catch (error) {
+      if (requestId !== comparisonRequestId) return;
+      info.textContent = `Comparison failed: ${error.name === "AbortError" ? "request timed out after 10 seconds" : error.message}`;
+      green.textContent = "Unavailable";
+      baseline.textContent = "Unavailable";
+      reduction.textContent = "—";
+      warning.textContent = "Comparison could not be completed. Check that the backend is running.";
+      warning.classList.add("warning");
+    } finally {
+      clearTimeout(timeoutId);
+      if (requestId === comparisonRequestId) button.disabled = false;
+    }
+  }
+
+  document.getElementById("taskForm").addEventListener("submit", async event => {
+    event.preventDefault();
+    const message = document.getElementById("message");
+    const button = document.getElementById("scheduleButton");
+    message.textContent = "Submitting workload and waiting for AWS worker…";
+    button.disabled = true;
+    const startedAt = new Date();
+    const startedPerf = performance.now();
+    document.getElementById("topStatus").textContent = "Running…";
+    document.getElementById("detailTaskName").textContent = document.getElementById("taskName").value.trim();
+    document.getElementById("detailStart").textContent = formatDate(startedAt);
+    document.getElementById("detailEnd").textContent = "Waiting…";
+    try {
+      const task = await api("/api/tasks", {
+        method: "POST",
+        body: JSON.stringify({
+          task_name: document.getElementById("taskName").value.trim(),
+          runtime_minutes: Number(document.getElementById("runtime").value),
+          energy_kwh: Number(document.getElementById("energy").value),
+          python_script: document.getElementById("pythonScript").value
+        })
+      });
+      const endedAt = new Date();
+      const elapsedSeconds = ((performance.now() - startedPerf) / 1000).toFixed(2);
+      document.getElementById("topStatus").textContent = task.status || "Submitted";
+      document.getElementById("topRegion").textContent = task.selected_region || "—";
+      document.getElementById("topDuration").textContent = `${elapsedSeconds} s`;
+      document.getElementById("topEmissions").textContent = task.estimated_emissions_gco2 == null ? "—" : `${task.estimated_emissions_gco2} g`;
+      document.getElementById("detailTaskName").textContent = task.task_name || document.getElementById("taskName").value.trim();
+      const returnedTaskId = task.task_id || task.id || task.taskId || task.task?.task_id;
+      document.getElementById("detailTaskId").textContent = returnedTaskId || "Not returned by backend";
+      if (!returnedTaskId) {
+        message.textContent = "Task response received, but the backend did not return a task ID. Check the POST /api/tasks response.";
+      }
+      document.getElementById("detailStatus").textContent = task.status || "—";
+      document.getElementById("detailMode").textContent = task.execution_mode || "—";
+      document.getElementById("detailGreenScore").textContent =
+        task.green_score == null ? "Unavailable" : Number(task.green_score).toFixed(2);
+      document.getElementById("detailDecisionMethod").textContent = task.selection_method || "—";
+      document.getElementById("detailEnd").textContent = formatDate(endedAt);
+      document.getElementById("detailDuration").textContent = `${elapsedSeconds} seconds (browser-observed request time)`;
+      document.getElementById("detailWorker").textContent =
+        task.cloud_execution?.hostname || task.cloud_execution?.worker || task.cloud_execution?.execution_location ||
+        (task.execution_mode === "AWS_EC2_SSH" ? "AWS EC2 · Sydney (hostname not returned)" : "Unavailable");
+      document.getElementById("selectedRegion").textContent = task.selected_region || "—";
+      document.getElementById("greenScoreLine").textContent =
+        `Green Score: ${task.green_score == null ? "Unavailable" : Number(task.green_score).toFixed(2)}`;
+      document.getElementById("renewableLine").textContent =
+        `Renewable energy: ${task.renewable_percent == null ? "Unavailable" : `${task.renewable_percent}%`}`;
+      document.getElementById("costLine").textContent =
+        `Estimated instance price: ${task.cost_usd_per_hour == null ? "Unavailable" : `$${Number(task.cost_usd_per_hour).toFixed(4)}/hour`}`;
+      document.getElementById("detailDecisionMethod").textContent = task.selection_method || "—";
+      document.getElementById("intensity").textContent =
+        `Carbon intensity: ${task.carbon_intensity_gco2_kwh} gCO₂e/kWh`;
+      document.getElementById("emissions").textContent =
+        `Estimated emissions: ${task.estimated_emissions_gco2} gCO₂e`;
+      document.getElementById("source").textContent = `Data source: ${task.carbon_data_source || "Unavailable"}`;
+      // Fill recommendation metrics from the task response when present; region data will provide fallback values.
+      document.getElementById("greenScoreLine").textContent =
+        `Green Score: ${task.green_score == null ? "Unavailable in task response" : Number(task.green_score).toFixed(2)}`;
+      document.getElementById("renewableLine").textContent =
+        `Renewable energy: ${task.renewable_percent == null ? "Unavailable in task response" : `${task.renewable_percent}%`}`;
+      document.getElementById("costLine").textContent =
+        `Estimated instance price: ${task.cost_usd_per_hour == null ? "Unavailable in task response" : `$${Number(task.cost_usd_per_hour).toFixed(4)}/hour`}`;
+      document.getElementById("decisionNote").textContent =
+        `${task.selection_method || "Scheduling decision"}. The recommendation is for scheduling; the configured AWS worker executes in Sydney.`;
+      message.textContent = `Task ${returnedTaskId || "(ID missing)"}: ${task.status || "response received"}. Execution mode: ${task.execution_mode || "unknown"}. Total request time: ${elapsedSeconds}s.`;
+      const output = document.getElementById("taskOutput");
+      output.textContent = task.cloud_execution
+        ? `AWS output:\\n${task.cloud_execution.stdout || task.cloud_execution.output || ""}\\nError:\\n${task.cloud_execution.stderr || task.cloud_execution.error || task.error || ""}`
+        : (task.error || "No cloud execution result returned.");
+
+      saveLastTaskUi({
+        task_id: returnedTaskId || null,
+        task_name: task.task_name || document.getElementById("taskName").value.trim(),
+        status: task.status || "response received",
+        execution_mode: task.execution_mode || "unknown",
+        selected_region: task.selected_region || null,
+        carbon_intensity_gco2_kwh: task.carbon_intensity_gco2_kwh ?? null,
+        carbon_data_source: task.carbon_data_source || null,
+        estimated_emissions_gco2: task.estimated_emissions_gco2 ?? null,
+        green_score: task.green_score ?? null,
+        green_score_status: task.green_score_status || null,
+        renewable_percent: task.renewable_percent ?? null,
+        cost_usd_per_hour: task.cost_usd_per_hour ?? null,
+        selection_method: task.selection_method || null,
+        request_started_at: startedAt.toISOString(),
+        response_received_at: endedAt.toISOString(),
+        request_elapsed_seconds: elapsedSeconds,
+        cloud_execution: task.cloud_execution || null,
+        error: task.error || null
+      });
+      await Promise.all([loadTasks(), loadRegions(), runComparison()]);
+    } catch (error) {
+      document.getElementById("topStatus").textContent = "Failed";
+      document.getElementById("detailStatus").textContent = "Request failed";
+      document.getElementById("detailEnd").textContent = formatDate(new Date());
+      document.getElementById("detailDuration").textContent = `${((performance.now() - startedPerf) / 1000).toFixed(2)} seconds`;
+      showError(message, error);
+    } finally {
+      button.disabled = false;
+    }
+  });
+
+  document.getElementById("refreshRegions").addEventListener("click", loadRegions);
+  document.getElementById("refreshTasks").addEventListener("click", loadTasks);
+  document.getElementById("refreshForecast").addEventListener("click", loadForecast);
+  document.getElementById("runComparison").addEventListener("click", runComparison);
+  document.getElementById("energy").addEventListener("change", () => {
+    runComparison();
+    loadRegions();
+  });
+
+  async function initializeDashboard() {
+    await Promise.all([loadRegions(), loadTasks(), loadForecast(), runComparison()]);
+    const saved = readLastTaskUi();
+    if (saved) {
+      if (saved.request_started_at) document.getElementById("detailStart").textContent = formatDate(saved.request_started_at);
+      if (saved.response_received_at) document.getElementById("detailEnd").textContent = formatDate(saved.response_received_at);
+      if (saved.request_elapsed_seconds != null) {
+        document.getElementById("detailDuration").textContent = `${saved.request_elapsed_seconds} seconds (browser-observed total request time)`;
+        document.getElementById("topDuration").textContent = `${saved.request_elapsed_seconds} s`;
+      }
+      if (saved.task_id) document.getElementById("detailTaskId").textContent = saved.task_id;
+      if (saved.task_name) document.getElementById("detailTaskName").textContent = saved.task_name;
+      if (saved.status) {
+        document.getElementById("detailStatus").textContent = saved.status;
+        document.getElementById("topStatus").textContent = saved.status;
+      }
+      if (saved.execution_mode) document.getElementById("detailMode").textContent = saved.execution_mode;
+      if (saved.selected_region) {
+        document.getElementById("topRegion").textContent = saved.selected_region;
+        document.getElementById("selectedRegion").textContent = saved.selected_region;
+      }
+      if (saved.cloud_execution) {
+        document.getElementById("detailWorker").textContent = saved.cloud_execution.hostname || saved.cloud_execution.worker || saved.cloud_execution.execution_location || "AWS EC2 · Sydney (hostname not returned)";
+        document.getElementById("taskOutput").textContent =
+          `AWS output:\\n${saved.cloud_execution.stdout || saved.cloud_execution.output || ""}\\nError:\\n${saved.cloud_execution.stderr || saved.cloud_execution.error || saved.error || ""}`;
+      } else if (saved.execution_mode === "AWS_EC2_SSH") {
+        document.getElementById("detailWorker").textContent = "AWS EC2 · Sydney (hostname not returned)";
+      }
+    }
+  }
+  initializeDashboard();
+</script>
+</body>
+</html>
